@@ -1,0 +1,151 @@
+name: Repo Sync
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # 每周一 06:00 UTC（北京 14:00）
+  push:
+    paths: ['project.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout scheduler repo
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Deploy Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.BACKUP_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git config --global user.name "repo-sync-bot"
+          git config --global user.email "repo-sync@murongruolan.local"
+          git config --global core.sshCommand "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no"
+
+      - name: Read project list
+        id: list
+        run: |
+          mapfile -t repos < <(grep -vE '^\s*(#|$)' project.md | sed 's/\s*#.*//' | sed 's/^\s*//' | sed 's/\s*$//')
+          echo "count=${#repos[@]}" >> $GITHUB_OUTPUT
+          for r in "${repos[@]}"; do echo "repo: $r" >&2; done
+          echo "${repos[@]}" > /tmp/repo_list.txt
+
+      - name: Sync each repo to exc_project_bak
+        run: |
+          set -euo pipefail
+          BACKUP_REPO="git@github.com:murongruolan/exc_project_bak.git"
+          SYNC_LOG="sync-log-$(date +%Y%m%d-%H%M%S).md"
+          echo "# Sync Log $(date -u '+%Y-%m-%d %H:%M UTC')" >> $SYNC_LOG
+          echo "" >> $SYNC_LOG
+
+          # 克隆私有备份库（全部备份分支）
+          git clone --bare "$BACKUP_REPO" /tmp/bak.git 2>/dev/null || {
+            echo "备份库克隆失败"; exit 1; }
+
+          while IFS= read -r repo; do
+            [ -z "$repo" ] && continue
+            echo "### $repo" >> $SYNC_LOG
+
+            # 清理上轮临时目录
+            rm -rf /tmp/upstream-clone /tmp/bak-work
+
+            # ① 检查上游是否存在
+            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              "https://api.github.com/repos/$repo" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "- ⏭️ SKIP: 上游不可达（HTTP $HTTP_CODE）——可能已删库或改名" >> $SYNC_LOG
+              continue
+            fi
+
+            # ② 获取上游 HEAD SHA
+            UP_HEAD=$(curl -s "https://api.github.com/repos/$repo/commits?per_page=1" \
+              | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['sha'])" 2>/dev/null || echo "")
+            if [ -z "$UP_HEAD" ]; then
+              echo "- ⏭️ SKIP: 无法获取上游 HEAD" >> $SYNC_LOG
+              continue
+            fi
+
+            # ③ 分支名（owner/repo → owner_repo）
+            BRANCH=$(echo "$repo" | tr '/' '_')
+
+            # ④ 克隆上游（浅克隆足够——备份用）
+            git clone --bare "https://github.com/$repo.git" /tmp/upstream-clone 2>/dev/null || {
+              echo "- ⏭️ SKIP: 上游 clone 失败" >> $SYNC_LOG
+              continue
+            }
+
+            # ⑤ 检查备份库是否已有该分支
+            HAS_BACKUP=$(git --git-dir=/tmp/bak.git rev-parse --verify "refs/heads/$BRANCH" 2>/dev/null && echo "yes" || echo "no")
+
+            if [ "$HAS_BACKUP" = "yes" ]; then
+              # ⑥ ancestor 检测：备份 HEAD 是否为上游 HEAD 的祖先
+              BAK_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/heads/$BRANCH")
+              if git --git-dir=/tmp/bak.git merge-base --is-ancestor "$BAK_HEAD" "$UP_HEAD" 2>/dev/null; then
+                # 正常更新：快进合并
+                echo "- ✅ fast-forward: $BAK_HEAD → $UP_HEAD" >> $SYNC_LOG
+                cd /tmp/bak.git
+                git fetch /tmp/upstream-clone "+refs/heads/*:refs/heads/*" --prune 2>/dev/null || true
+                git update-ref "refs/heads/$BRANCH" "$UP_HEAD" 2>/dev/null || true
+                cd - > /dev/null
+              else
+                # ⑦ 强推检测：上游历史重写 → 保留旧备份到 rewind 分支 + 用新历史覆盖主备份分支
+                REWIND_BRANCH="${BRANCH}_rewritten_$(date +%Y%m%d)"
+                echo "- ⚠️ FORCE-PUSH detected: 上游历史重写（备份 $BAK_HEAD 不是上游 $UP_HEAD 的祖先）" >> $SYNC_LOG
+                echo "- 📦 旧备份保留至分支 $REWIND_BRANCH；新历史写入 $BRANCH" >> $SYNC_LOG
+                cd /tmp/bak.git
+                git update-ref "refs/heads/$REWIND_BRANCH" "$BAK_HEAD"
+                git fetch /tmp/upstream-clone "+refs/heads/*:refs/heads/*" --prune 2>/dev/null || true
+                git update-ref "refs/heads/$BRANCH" "$UP_HEAD" 2>/dev/null || true
+                cd - > /dev/null
+              fi
+            else
+              # ⑧ 新项目：首次备份
+              echo "- 🆕 首次备份：$UP_HEAD" >> $SYNC_LOG
+              cd /tmp/bak.git
+              git fetch /tmp/upstream-clone "+refs/heads/*:refs/heads/*" --prune 2>/dev/null || true
+              # 从上游默认分支创建备份分支
+              UP_DEFAULT=$(git --git-dir=/tmp/upstream-clone symbolic-ref HEAD 2>/dev/null | sed 's|refs/heads/||' || echo "main")
+              git update-ref "refs/heads/$BRANCH" "$(git --git-dir=/tmp/upstream-clone rev-parse "refs/heads/$UP_DEFAULT" 2>/dev/null || git --git-dir=/tmp/upstream-clone rev-parse HEAD)" 2>/dev/null || true
+              cd - > /dev/null
+            fi
+
+            # ⑨ 同步日志追加
+            FINAL_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/heads/$BRANCH" 2>/dev/null || echo "N/A")
+            echo "- 当前备份 HEAD: $FINAL_HEAD" >> $SYNC_LOG
+            echo "" >> $SYNC_LOG
+
+            # 清理
+            rm -rf /tmp/upstream-clone
+          done < /tmp/repo_list.txt
+
+      - name: Push backup repo
+        run: |
+          cd /tmp/bak.git
+          git --git-dir=. push --all "git@github.com:murongruolan/exc_project_bak.git" --force-with-lease 2>&1 | tail -5
+          echo "push exit: $?"
+
+      - name: Commit sync log to scheduler repo
+        run: |
+          SYNC_FILE=$(ls sync-log-*.md 2>/dev/null | head -1)
+          if [ -n "$SYNC_FILE" ]; then
+            mkdir -p logs
+            cp "$SYNC_FILE" logs/
+            git add logs/
+            git diff --cached --quiet || git commit -m "sync log: $(date -u '+%Y-%m-%d %H:%M')"
+            git push origin HEAD:${{ github.ref }} || true
+          fi
+
+      - name: Summary
+        run: |
+          echo "## Sync Summary" >> $GITHUB_STEP_SUMMARY
+          cat sync-log-*.md >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "(no log)" >> $GITHUB_STEP_SUMMARY
