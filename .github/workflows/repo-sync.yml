@@ -53,7 +53,8 @@ jobs:
             # ② 拉上游全部分支+标签到本地命名空间（不直接写 refs/heads）
             git --git-dir=/tmp/bak.git remote add up "https://github.com/$repo.git" 2>/dev/null || true
             if ! git --git-dir=/tmp/bak.git fetch up "+refs/heads/*:refs/remotes/up/*" "+refs/tags/*:refs/tags/*" >/tmp/fetch.log 2>&1; then
-              echo "  SKIP: fetch failed" >> "$SYNC_LOG"
+              echo "  SKIP: fetch failed:" >> "$SYNC_LOG"
+              tail -5 /tmp/fetch.log | sed 's/^/    /' >> "$SYNC_LOG" || true
               continue
             fi
 
