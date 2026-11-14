@@ -41,76 +41,53 @@ jobs:
           echo "Repos to sync: $REPOS"
 
           rm -rf /tmp/bak.git
-          echo "DEBUG: attempting backup clone..."
           git clone --bare "$BACKUP_REPO" /tmp/bak.git 2>&1 || {
             echo "ERROR: backup clone failed" >> "$SYNC_LOG"
-            cat "$SYNC_LOG"
             exit 1
           }
-
-          NOW=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
           for repo in $REPOS; do
             BRANCH=$(echo "$repo" | tr '/' '_')
             echo "### $repo" >> "$SYNC_LOG"
-            echo "  Processing $repo (branch=$BRANCH)..." >&2
 
-            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-              "https://api.github.com/repos/$repo" 2>/dev/null || echo "000")
+            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://api.github.com/repos/$repo" 2>/dev/null || echo "000")
             if [ "$HTTP_CODE" != "200" ]; then
-              echo "  SKIP: upstream unreachable (HTTP $HTTP_CODE)" >> "$SYNC_LOG"
-              echo "" >> "$SYNC_LOG"
+              echo "  SKIP: unreachable (HTTP $HTTP_CODE)" >> "$SYNC_LOG"
               continue
             fi
 
-            UP_HEAD=$(curl -s "https://api.github.com/repos/$repo/commits?per_page=1" \
-              | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['sha'] if d else '')" 2>/dev/null || echo "")
-            if [ -z "$UP_HEAD" ]; then
-              echo "  SKIP: cannot get upstream HEAD" >> "$SYNC_LOG"
-              echo "" >> "$SYNC_LOG"
-              continue
-            fi
-
-            rm -rf /tmp/upstream.git
-            git clone --bare "https://github.com/$repo.git" /tmp/upstream.git 2>&1 || {
-              echo "  SKIP: upstream clone failed" >> "$SYNC_LOG"
-              echo "" >> "$SYNC_LOG"
+            git --git-dir=/tmp/bak.git remote add up "https://github.com/$repo.git" 2>/dev/null || true
+            git --git-dir=/tmp/bak.git fetch up "+refs/heads/*:refs/remotes/up/*" 2>&1 | tail -3 || {
+              echo "  SKIP: fetch failed" >> "$SYNC_LOG"
               continue
             }
 
-            UP_DEFAULT_BRANCH=$(git --git-dir=/tmp/upstream.git symbolic-ref HEAD 2>/dev/null | sed 's|refs/heads/||' || echo "main")
-            UP_DEFAULT_HEAD=$(git --git-dir=/tmp/upstream.git rev-parse "refs/heads/$UP_DEFAULT" 2>/dev/null || echo "")
+            UP_DEFAULT_BRANCH=$(git --git-dir=/tmp/bak.git symbolic-ref "refs/remotes/up/HEAD" 2>/dev/null | sed 's|refs/remotes/up/||' || echo "main")
+            UP_DEFAULT_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/remotes/up/$UP_DEFAULT_BRANCH" 2>/dev/null || echo "")
 
             BAK_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/heads/$BRANCH" 2>/dev/null || echo "")
 
             if [ -n "$BAK_HEAD" ]; then
-              if git --git-dir=/tmp/bak.git merge-base --is-ancestor "$BAK_HEAD" "$UP_DEFAULT_HEAD" 2>/dev/null; then
+              if [ -n "$UP_DEFAULT_HEAD" ] && git --git-dir=/tmp/bak.git merge-base --is-ancestor "$BAK_HEAD" "$UP_DEFAULT_HEAD" 2>/dev/null; then
                 git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD"
                 echo "  fast-forward: ${BAK_HEAD:0:8} -> ${UP_DEFAULT_HEAD:0:8}" >> "$SYNC_LOG"
               else
-                REWIND="${BRANCH}_rewritten_$(date +%Y%m%d)"
-                git --git-dir=/tmp/bak.git update-ref "refs/heads/$REWIND" "$BAK_HEAD"
-                git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD"
-                echo "  force-push detected: backup preserved at $REWIND" >> "$SYNC_LOG"
+                REWIND="${BRANCH}_rw_$(date +%Y%m%d)"
+                git --git-dir=/tmp/bak.git update-ref "refs/heads/$REWIND" "$BAK_HEAD" 2>/dev/null || true
+                [ -n "$UP_DEFAULT_HEAD" ] && git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD"
+                echo "  force-push: backup preserved at $REWIND" >> "$SYNC_LOG"
               fi
             else
               if [ -z "$UP_DEFAULT_HEAD" ]; then
-                echo "  SKIP: upstream default HEAD is empty" >> "$SYNC_LOG"
-                echo "" >> "$SYNC_LOG"
+                echo "  SKIP: upstream HEAD empty" >> "$SYNC_LOG"
                 continue
               fi
-              git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD" || {
-                echo "  SKIP: cannot create backup branch" >> "$SYNC_LOG"
-                echo "" >> "$SYNC_LOG"
-                continue
-              }
+              git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD"
               echo "  first-backup: ${UP_DEFAULT_HEAD:0:8}" >> "$SYNC_LOG"
             fi
 
-            FINAL=$(git --git-dir=/tmp/bak.git rev-parse "refs/heads/$BRANCH" 2>/dev/null || echo "")
-            echo "  backup-head: $FINAL" >> "$SYNC_LOG"
+            git --git-dir=/tmp/bak.git remote remove up 2>/dev/null || true
             echo "" >> "$SYNC_LOG"
-            rm -rf /tmp/upstream.git
           done
 
           cd /tmp/bak.git
@@ -128,4 +105,4 @@ jobs:
           mkdir -p logs
           for f in sync-log-*.md; do [ -f "$f" ] && cp "$f" logs/; done
           git add logs/
-          git diff --cached --quiet || { git commit -m "sync log $(date -u '+%Y-%m-%d')"; git push; }
+          git diff --cached --quiet || { git commit -m "sync log"; git push; }
