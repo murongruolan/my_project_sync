@@ -41,6 +41,7 @@ jobs:
           echo "Repos to sync: $REPOS"
 
           rm -rf /tmp/bak.git
+          echo "DEBUG: attempting backup clone..."
           git clone --bare "$BACKUP_REPO" /tmp/bak.git 2>&1 || {
             echo "ERROR: backup clone failed" >> "$SYNC_LOG"
             cat "$SYNC_LOG"
