@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: repo-sync
@@ -33,7 +33,6 @@ jobs:
 
       - name: Sync
         run: |
-          set -o pipefail
           BACKUP_REPO="git@github.com:murongruolan/exc_project_bak.git"
           SYNC_LOG="sync-log-$(date +%Y%m%d-%H%M%S).md"
           echo "# Sync Log $(date -u '+%Y-%m-%d %H:%M UTC')" > "$SYNC_LOG"
