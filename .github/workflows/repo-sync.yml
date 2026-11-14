@@ -22,6 +22,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Sync
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_GH_TOKEN }}
         run: |
           set -uo pipefail
           BACKUP_REPO="https://murongruolan:${{ secrets.BACKUP_GH_TOKEN }}@github.com/murongruolan/exc_project_bak.git"
@@ -41,8 +43,8 @@ jobs:
             BRANCH="${repo/\//_}"
             echo "### $repo" >> "$SYNC_LOG"
 
-            # ① 一次 API 调用：可达性 + 默认分支名（删库/改名/限流都会在这里被拦下）
-            DEFAULT_BRANCH=$(curl -sf "https://api.github.com/repos/$repo" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('default_branch',''))" 2>/dev/null || echo "")
+            # ① 一次 API 调用（带 token 防 runner IP 限流）：可达性 + 默认分支名
+            DEFAULT_BRANCH=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('default_branch',''))" 2>/dev/null || echo "")
             if [ -z "$DEFAULT_BRANCH" ]; then
               echo "  SKIP: unreachable (deleted / renamed / rate-limited)" >> "$SYNC_LOG"
               continue
