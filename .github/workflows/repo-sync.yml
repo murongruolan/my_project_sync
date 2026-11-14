@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: repo-sync
@@ -21,19 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup SSH + Git
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.BACKUP_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          git config --global user.name "repo-sync-bot"
-          git config --global user.email "repo-sync@murongruolan.local"
-          git config --global core.sshCommand "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no"
-
       - name: Sync
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_GH_TOKEN }}
         run: |
-          BACKUP_REPO="git@github.com:murongruolan/exc_project_bak.git"
+          BACKUP_REPO="https://murongruolan:${{ secrets.BACKUP_GH_TOKEN }}@github.com/murongruolan/exc_project_bak.git"
           SYNC_LOG="sync-log-$(date +%Y%m%d-%H%M%S).md"
           echo "# Sync Log $(date -u '+%Y-%m-%d %H:%M UTC')" > "$SYNC_LOG"
 
