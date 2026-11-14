@@ -94,7 +94,12 @@ jobs:
                 echo "  force-push detected: backup preserved at $REWIND" >> "$SYNC_LOG"
               fi
             else
-              git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD" 2>/dev/null || {
+              if [ -z "$UP_DEFAULT_HEAD" ]; then
+                echo "  SKIP: upstream default HEAD is empty" >> "$SYNC_LOG"
+                echo "" >> "$SYNC_LOG"
+                continue
+              fi
+              git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD" || {
                 echo "  SKIP: cannot create backup branch" >> "$SYNC_LOG"
                 echo "" >> "$SYNC_LOG"
                 continue
