@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: repo-sync
@@ -17,73 +17,90 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - name: Sync
-        env:
-          GH_TOKEN: ${{ secrets.BACKUP_GH_TOKEN }}
         run: |
-          set -x
+          set -uo pipefail
           BACKUP_REPO="https://murongruolan:${{ secrets.BACKUP_GH_TOKEN }}@github.com/murongruolan/exc_project_bak.git"
           SYNC_LOG="sync-log-$(date +%Y%m%d-%H%M%S).md"
           echo "# Sync Log $(date -u '+%Y-%m-%d %H:%M UTC')" > "$SYNC_LOG"
 
-          REPOS=$(grep -vE '^\s*(#|$)' project.md | sed 's/\s*#.*//' | xargs)
+          REPOS=$(grep -vE '^\s*(#|$)' project.md | sed 's/\s*#.*//' | sed 's/[[:space:]]//g' | sort -u)
           echo "Repos to sync: $REPOS"
 
           rm -rf /tmp/bak.git
-          git clone --bare "$BACKUP_REPO" /tmp/bak.git 2>&1 || {
+          if ! git clone --bare "$BACKUP_REPO" /tmp/bak.git 2>/dev/null; then
             echo "ERROR: backup clone failed" >> "$SYNC_LOG"
             exit 1
-          }
+          fi
 
           for repo in $REPOS; do
-            BRANCH=$(echo "$repo" | tr '/' '_')
+            BRANCH="${repo/\//_}"
             echo "### $repo" >> "$SYNC_LOG"
 
-            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://api.github.com/repos/$repo" 2>/dev/null || echo "000")
-            if [ "$HTTP_CODE" != "200" ]; then
-              echo "  SKIP: unreachable (HTTP $HTTP_CODE)" >> "$SYNC_LOG"
+            # ① 一次 API 调用：可达性 + 默认分支名（删库/改名/限流都会在这里被拦下）
+            DEFAULT_BRANCH=$(curl -sf "https://api.github.com/repos/$repo" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('default_branch',''))" 2>/dev/null || echo "")
+            if [ -z "$DEFAULT_BRANCH" ]; then
+              echo "  SKIP: unreachable (deleted / renamed / rate-limited)" >> "$SYNC_LOG"
               continue
             fi
 
+            # ② 拉上游全部分支+标签到本地命名空间（不直接写 refs/heads）
             git --git-dir=/tmp/bak.git remote add up "https://github.com/$repo.git" 2>/dev/null || true
-            git --git-dir=/tmp/bak.git fetch up "+refs/heads/*:refs/remotes/up/*" 2>&1 | tail -3 || {
+            if ! git --git-dir=/tmp/bak.git fetch up "+refs/heads/*:refs/remotes/up/*" "+refs/tags/*:refs/tags/*" >/tmp/fetch.log 2>&1; then
               echo "  SKIP: fetch failed" >> "$SYNC_LOG"
               continue
-            }
+            fi
 
-            UP_DEFAULT_HEAD=$UP_HEAD
+            # ③ 默认分支 HEAD：从已 fetch 的本地 refs 解析（不再依赖 symbolic-ref / 再调 API）
+            UP_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/remotes/up/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+            if [ -z "$UP_HEAD" ]; then
+              echo "  SKIP: default branch '$DEFAULT_BRANCH' missing after fetch" >> "$SYNC_LOG"
+              continue
+            fi
 
+            # ④ 主备份分支：快进 or 重写保留（force-push 检测）
             BAK_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/heads/$BRANCH" 2>/dev/null || echo "")
-
             if [ -n "$BAK_HEAD" ]; then
-              if [ -n "$UP_DEFAULT_HEAD" ] && git --git-dir=/tmp/bak.git merge-base --is-ancestor "$BAK_HEAD" "$UP_DEFAULT_HEAD" 2>/dev/null; then
-                git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD"
-                echo "  fast-forward: ${BAK_HEAD:0:8} -> ${UP_DEFAULT_HEAD:0:8}" >> "$SYNC_LOG"
+              if git --git-dir=/tmp/bak.git merge-base --is-ancestor "$BAK_HEAD" "$UP_HEAD" 2>/dev/null; then
+                git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_HEAD"
+                echo "  fast-forward: ${BAK_HEAD:0:8} -> ${UP_HEAD:0:8}" >> "$SYNC_LOG"
               else
                 REWIND="${BRANCH}_rw_$(date +%Y%m%d)"
                 git --git-dir=/tmp/bak.git update-ref "refs/heads/$REWIND" "$BAK_HEAD" 2>/dev/null || true
-                [ -n "$UP_DEFAULT_HEAD" ] && git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD"
-                echo "  force-push: backup preserved at $REWIND" >> "$SYNC_LOG"
+                git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_HEAD"
+                echo "  FORCE-PUSH detected: old backup preserved at $REWIND" >> "$SYNC_LOG"
               fi
             else
-              if [ -z "$UP_DEFAULT_HEAD" ]; then
-                echo "  SKIP: upstream HEAD empty" >> "$SYNC_LOG"
-                continue
-              fi
-              git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_DEFAULT_HEAD"
-              echo "  first-backup: ${UP_DEFAULT_HEAD:0:8}" >> "$SYNC_LOG"
+              git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_HEAD"
+              echo "  first-backup: ${UP_HEAD:0:8}" >> "$SYNC_LOG"
             fi
 
+            # ⑤ 其余分支：upstream X → owner_repo__X（默认分支已在 ④ 备份）
+            EXTRA=0
+            for ref in $(git --git-dir=/tmp/bak.git for-each-ref --format='%(refname)' refs/remotes/up/); do
+              SUB="${ref#refs/remotes/up/}"
+              [ "$SUB" = "$DEFAULT_BRANCH" ] && continue
+              git --git-dir=/tmp/bak.git update-ref "refs/heads/${BRANCH}__${SUB}" "refs/remotes/up/${SUB}" 2>/dev/null || true
+              EXTRA=$((EXTRA+1))
+            done
+            if [ "$EXTRA" -gt 0 ]; then
+              echo "  extra-branches: $EXTRA (as ${BRANCH}__<branch>)" >> "$SYNC_LOG"
+            fi
+
+            # ⑥ 清理本 repo 的 remote-tracking refs（防污染下一个 repo）
+            git --git-dir=/tmp/bak.git for-each-ref --format='delete %(refname)' refs/remotes/up/ | git --git-dir=/tmp/bak.git update-ref --stdin 2>/dev/null || true
             git --git-dir=/tmp/bak.git remote remove up 2>/dev/null || true
             echo "" >> "$SYNC_LOG"
           done
 
+          # ⑦ 推送：全部分支 + 标签（--force 允许 rewind 覆盖与标签前移）
           cd /tmp/bak.git
-          git push --all "$BACKUP_REPO" 2>&1 || true
+          git push --force --all "$BACKUP_REPO" 2>&1 | tail -12 || true
+          git push --force --tags "$BACKUP_REPO" 2>&1 | tail -6 || true
 
       - name: Log
         if: always()
@@ -94,6 +111,8 @@ jobs:
       - name: Save log
         if: always()
         run: |
+          git config user.name "repo-sync-bot"
+          git config user.email "repo-sync-bot@users.noreply.github.com"
           mkdir -p logs
           for f in sync-log-*.md; do [ -f "$f" ] && cp "$f" logs/; done
           git add logs/
