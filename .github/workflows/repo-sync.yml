@@ -25,6 +25,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BACKUP_GH_TOKEN }}
         run: |
+          set -x
           BACKUP_REPO="https://murongruolan:${{ secrets.BACKUP_GH_TOKEN }}@github.com/murongruolan/exc_project_bak.git"
           SYNC_LOG="sync-log-$(date +%Y%m%d-%H%M%S).md"
           echo "# Sync Log $(date -u '+%Y-%m-%d %H:%M UTC')" > "$SYNC_LOG"
