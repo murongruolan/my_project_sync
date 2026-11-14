@@ -55,8 +55,7 @@ jobs:
               continue
             }
 
-            UP_DEFAULT_BRANCH=$(git --git-dir=/tmp/bak.git symbolic-ref "refs/remotes/up/HEAD" 2>/dev/null | sed 's|refs/remotes/up/||' || echo "main")
-            UP_DEFAULT_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/remotes/up/$UP_DEFAULT_BRANCH" 2>/dev/null || echo "")
+            UP_DEFAULT_HEAD=$UP_HEAD
 
             BAK_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/heads/$BRANCH" 2>/dev/null || echo "")
 
