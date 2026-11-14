@@ -59,14 +59,14 @@ jobs:
             fi
 
             # ③ 默认分支 HEAD：从已 fetch 的本地 refs 解析（不再依赖 symbolic-ref / 再调 API）
-            UP_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/remotes/up/$DEFAULT_BRANCH" 2>/dev/null || echo "")
+            UP_HEAD=$(git --git-dir=/tmp/bak.git rev-parse --verify "refs/remotes/up/$DEFAULT_BRANCH" 2>/dev/null || echo "")
             if [ -z "$UP_HEAD" ]; then
               echo "  SKIP: default branch '$DEFAULT_BRANCH' missing after fetch" >> "$SYNC_LOG"
               continue
             fi
 
             # ④ 主备份分支：快进 or 重写保留（force-push 检测）
-            BAK_HEAD=$(git --git-dir=/tmp/bak.git rev-parse "refs/heads/$BRANCH" 2>/dev/null || echo "")
+            BAK_HEAD=$(git --git-dir=/tmp/bak.git rev-parse --verify "refs/heads/$BRANCH" 2>/dev/null || echo "")
             if [ -n "$BAK_HEAD" ]; then
               if git --git-dir=/tmp/bak.git merge-base --is-ancestor "$BAK_HEAD" "$UP_HEAD" 2>/dev/null; then
                 git --git-dir=/tmp/bak.git update-ref "refs/heads/$BRANCH" "$UP_HEAD"
